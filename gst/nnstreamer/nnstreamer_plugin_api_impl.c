@@ -25,6 +25,68 @@ static const gchar *gst_tensor_time_sync_mode_string[] = {
   [SYNC_END] = NULL
 };
 
+#define NNS_TENSOR_EXTRA_MAGIC 0xf00dc0de
+
+/**
+ * @brief Data structure to describe a "extra" tensor data.
+ * This represents the information of the NNS_TENSOR_SIZE_LIMIT-th memory block for tensor stream.
+ */
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  uint32_t num_extra_tensors;
+  uint64_t reserved;
+  GstTensorInfo infos[NNS_TENSOR_SIZE_EXTRA_LIMIT];
+} GstTensorExtraInfo;
+
+/**
+ * @brief Check if given memory has extra tensors.
+ * @param[in] map GstMapInfo of GstMemory to be checked.
+ * @return TRUE if @map has extra tensors, otherwise FALSE.
+ */
+static gboolean
+gst_memory_map_is_extra_tensor (GstMapInfo * map)
+{
+  GstTensorExtraInfo *extra_info;
+  gboolean is_extra;
+
+  g_return_val_if_fail (map != NULL, FALSE);
+
+  if (map->size < sizeof (GstTensorExtraInfo))
+    return FALSE;
+
+  extra_info = (GstTensorExtraInfo *) map->data;
+
+  /* check magic in header (extra info) of the memory */
+  is_extra = (extra_info && extra_info->magic == NNS_TENSOR_EXTRA_MAGIC);
+
+  return is_extra;
+}
+
+/**
+ * @brief Initialize GstTensorExtraInfo structure with given @a memory.
+ * @param[in/out] extra GstTensorExtraInfo to be initialized.
+ * @param[in] reserved_size The memory size of extra memory block.
+ */
+static void
+gst_tensor_extra_info_init (GstTensorExtraInfo * extra, gsize reserved_size)
+{
+  guint i;
+
+  g_return_if_fail (extra != NULL);
+
+  extra->magic = NNS_TENSOR_EXTRA_MAGIC;
+  extra->version = 0;
+  extra->num_extra_tensors = 0;
+
+  /* set reserved size of NNS_TENSOR_SIZE_LIMIT-th memory */
+  extra->reserved = reserved_size;
+  for (i = 0; i < NNS_TENSOR_SIZE_EXTRA_LIMIT; ++i) {
+    gst_tensor_info_init (&extra->infos[i]);
+  }
+}
+
 /**
  * @brief Get the corresponding mode from the string value.
  * @param[in] str The string value for the mode.
@@ -278,7 +340,7 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
   guint counting, empty_pad;
   GstTensorsConfig in_configs;
   GstClockTime base_time = 0;
-  guint i, n_mem;
+  guint i;
   GstMemory *in_mem[NNS_TENSOR_SIZE_LIMIT + NNS_TENSOR_SIZE_EXTRA_LIMIT];
   tensor_format in_formats[NNS_TENSOR_SIZE_LIMIT + NNS_TENSOR_SIZE_EXTRA_LIMIT];
 
@@ -314,6 +376,8 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
 
   walk = collect->data;
 
+  gst_tensors_config_init (&in_configs);
+
   while (walk) {
     gboolean configured = FALSE;
     gboolean is_empty = FALSE;
@@ -324,6 +388,9 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
     if (gst_pad_has_current_caps (pad->pad)) {
       GstCaps *caps = gst_pad_get_current_caps (pad->pad);
       GstStructure *s = gst_caps_get_structure (caps, 0);
+
+      if (gst_tensors_config_validate (&in_configs))
+        gst_tensors_config_free (&in_configs);
 
       gst_tensors_config_from_structure (&in_configs, s);
       gst_caps_unref (caps);
@@ -385,38 +452,25 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
     }
 
     if (GST_IS_BUFFER (buf)) {
+      guint32 n_tensor = gst_tensor_buffer_get_count (buf);
       buf = gst_tensor_buffer_from_config (buf, &in_configs);
-      n_mem = gst_buffer_n_memory (buf);
 
       /** These are internal logic error. If given inputs are incorrect,
           the negotiation should have been failed before this stage. */
       if (gst_tensors_config_is_static (&in_configs))
-        g_assert (n_mem == in_configs.info.num_tensors);
-      g_assert ((counting + n_mem) <=
+        g_assert (n_tensor == in_configs.info.num_tensors);
+      g_assert ((counting + n_tensor) <=
           NNS_TENSOR_SIZE_LIMIT + NNS_TENSOR_SIZE_EXTRA_LIMIT);
 
       if (gst_tensors_config_is_flexible (&in_configs))
         configs->info.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
 
-      for (i = 0; i < n_mem; ++i) {
-        in_mem[counting] = gst_buffer_get_memory (buf, i);
+      for (i = 0; i < n_tensor; ++i) {
+        in_mem[counting] = gst_tensor_buffer_get_nth_memory (buf, i);
 
         /* set info */
-        if (counting >= NNS_TENSOR_SIZE_LIMIT) {
-          /* initialize extra info */
-          if (counting == NNS_TENSOR_SIZE_LIMIT) {
-            if (!gst_tensors_info_extra_create (&configs->info)) {
-              ml_loge ("Failed to create extra info.");
-              gst_buffer_unref (buf);
-              return FALSE;
-            }
-          }
-
-          gst_tensor_info_copy (&configs->info.extra[counting -
-                  NNS_TENSOR_SIZE_LIMIT], &in_configs.info.info[i]);
-        } else {
-          configs->info.info[counting] = in_configs.info.info[i];
-        }
+        gst_tensor_info_copy (gst_tensors_info_get_nth_info (&configs->info,
+                counting), gst_tensors_info_get_nth_info (&in_configs.info, i));
         in_formats[counting] = in_configs.info.format;
         counting++;
       }
@@ -491,6 +545,7 @@ gst_tensor_buffer_from_config (GstBuffer * in, GstTensorsConfig * config)
   gsize total, offset;
   gsize mem_size[NNS_TENSOR_SIZE_LIMIT];
   gboolean configured = FALSE;
+  gboolean is_extra = FALSE;
 
   if (!GST_IS_BUFFER (in)) {
     nns_loge ("Failed to get tensor buffer, invalid input buffer.");
@@ -514,8 +569,15 @@ gst_tensor_buffer_from_config (GstBuffer * in, GstTensorsConfig * config)
     }
 
     num = config->info.num_tensors;
+    if ((is_extra = (num > NNS_TENSOR_SIZE_LIMIT)))
+      num = NNS_TENSOR_SIZE_LIMIT;
     for (i = 0; i < num; i++)
       mem_size[i] = gst_tensors_info_get_size (&config->info, i);
+    if (is_extra) {
+      mem_size[num - 1] += sizeof (GstTensorExtraInfo);
+      for (; i < config->info.num_tensors; i++)
+        mem_size[num - 1] += gst_tensors_info_get_size (&config->info, i);
+    }
   } else {
     if (num > 1) {
       /* Suppose it is already configured. */
@@ -533,6 +595,12 @@ gst_tensor_buffer_from_config (GstBuffer * in, GstTensorsConfig * config)
     while (offset < total) {
       GstTensorMetaInfo meta;
       gpointer h = map.data + offset;
+
+      if (num >= NNS_TENSOR_SIZE_LIMIT - 1) {
+        /* Suppose remained memory may include extra tensors. */
+        mem_size[num++] = total - offset;
+        break;
+      }
 
       gst_tensor_meta_info_parse_header (&meta, h);
       mem_size[num] = gst_tensor_meta_info_get_header_size (&meta);
@@ -1216,17 +1284,19 @@ gst_tensor_pad_possible_caps_from_config (GstPad * pad,
 }
 
 /**
- * @brief Check current pad caps is flexible tensor.
- * @param pad GstPad to check current caps
- * @return TRUE if pad has flexible tensor caps.
- */
-gboolean
-gst_tensor_pad_caps_is_flexible (GstPad * pad)
+  * @brief Get tensor format of current pad caps.
+  * @param pad GstPad to check current caps.
+  * @return The tensor_format of current pad caps.
+  *
+  * If pad does not have tensor caps return _NNS_TENSOR_FORMAT_END
+  */
+tensor_format
+gst_tensor_pad_get_format (GstPad * pad)
 {
   GstCaps *caps;
-  gboolean ret = FALSE;
+  tensor_format ret = _NNS_TENSOR_FORMAT_END;
 
-  g_return_val_if_fail (GST_IS_PAD (pad), FALSE);
+  g_return_val_if_fail (GST_IS_PAD (pad), _NNS_TENSOR_FORMAT_END);
 
   caps = gst_pad_get_current_caps (pad);
   if (caps) {
@@ -1234,9 +1304,9 @@ gst_tensor_pad_caps_is_flexible (GstPad * pad)
     GstTensorsConfig config;
 
     structure = gst_caps_get_structure (caps, 0);
-    if (gst_tensors_config_from_structure (&config, structure))
-      ret = gst_tensors_config_is_flexible (&config);
-
+    if (gst_tensors_config_from_structure (&config, structure)) {
+      ret = config.info.format;
+    }
     gst_caps_unref (caps);
     gst_tensors_config_free (&config);
   }
@@ -1395,12 +1465,19 @@ gboolean
 gst_tensor_meta_info_parse_memory (GstTensorMetaInfo * meta, GstMemory * mem)
 {
   GstMapInfo map;
+  gsize hsize, msize;
   gboolean ret;
 
   g_return_val_if_fail (mem != NULL, FALSE);
   g_return_val_if_fail (meta != NULL, FALSE);
 
   gst_tensor_meta_info_init (meta);
+
+  /* Check header size of tensor-meta. */
+  hsize = gst_tensor_meta_info_get_header_size (meta);
+  msize = gst_memory_get_sizes (mem, NULL, NULL);
+  if (msize < hsize)
+    return FALSE;
 
   if (!gst_memory_map (mem, &map, GST_MAP_READ)) {
     nns_loge ("Failed to get the meta, cannot map the memory.");
@@ -1455,68 +1532,6 @@ gst_tensor_meta_info_append_header (GstTensorMetaInfo * meta, GstMemory * mem)
   return new_mem;
 }
 
-#define NNS_TENSOR_EXTRA_MAGIC 0xf00dc0de
-
-/**
- * @brief Data structure to describe a "extra" tensor data.
- * This represents the information of the NNS_TENSOR_SIZE_LIMIT-th memory block for tensor stream.
- */
-typedef struct
-{
-  uint32_t magic;
-  uint32_t version;
-  uint32_t num_extra_tensors;
-  uint64_t reserved;
-  GstTensorInfo infos[NNS_TENSOR_SIZE_EXTRA_LIMIT];
-} GstTensorExtraInfo;
-
-/**
- * @brief Check if given memory has extra tensors.
- * @param[in] map GstMapInfo of GstMemory to be checked.
- * @return TRUE if @map has extra tensors, otherwise FALSE.
- */
-static gboolean
-gst_memory_is_extra_tensor (GstMapInfo * map)
-{
-  GstTensorExtraInfo *extra_info;
-  gboolean is_extra;
-
-  g_return_val_if_fail (map != NULL, FALSE);
-
-  if (map->size < sizeof (GstTensorExtraInfo))
-    return FALSE;
-
-  extra_info = (GstTensorExtraInfo *) map->data;
-
-  /* check magic in header (extra info) of the memory */
-  is_extra = (extra_info && extra_info->magic == NNS_TENSOR_EXTRA_MAGIC);
-
-  return is_extra;
-}
-
-/**
- * @brief Initialize GstTensorExtraInfo structure with given @a memory.
- * @param[in/out] extra GstTensorExtraInfo to be initialized.
- * @param[in] reserved_size The memory size of extra memory block.
- */
-static void
-gst_tensor_extra_info_init (GstTensorExtraInfo * extra, gsize reserved_size)
-{
-  guint i;
-
-  g_return_if_fail (extra != NULL);
-
-  extra->magic = NNS_TENSOR_EXTRA_MAGIC;
-  extra->version = 0;
-  extra->num_extra_tensors = 0;
-
-  /* set reserved size of NNS_TENSOR_SIZE_LIMIT-th memory */
-  extra->reserved = reserved_size;
-  for (i = 0; i < NNS_TENSOR_SIZE_EXTRA_LIMIT; ++i) {
-    gst_tensor_info_init (&extra->infos[i]);
-  }
-}
-
 /**
  * @brief Get the nth GstMemory from given @a buffer.
  * @param[in] buffer GstBuffer to be parsed.
@@ -1536,7 +1551,7 @@ gst_tensor_buffer_get_nth_memory (GstBuffer * buffer, const guint index)
     return NULL;
   }
 
-  num_tensors = gst_buffer_n_tensor (buffer);
+  num_tensors = gst_tensor_buffer_get_count (buffer);
   if (num_tensors == 0U) {
     nns_loge ("num_tensors is 0. Please check the buffer.");
     return NULL;
@@ -1569,7 +1584,7 @@ gst_tensor_buffer_get_nth_memory (GstBuffer * buffer, const guint index)
   }
 
   /* check header (extra info) of the memory */
-  if (!gst_memory_is_extra_tensor (&extra_tensors_map)) {
+  if (!gst_memory_map_is_extra_tensor (&extra_tensors_map)) {
     nns_loge ("Invalid extra header");
     gst_memory_unmap (extra_tensors_memory, &extra_tensors_map);
     gst_memory_unref (extra_tensors_memory);
@@ -1629,14 +1644,13 @@ gboolean
 gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
     const GstTensorInfo * info)
 {
-  guint num_mems, offset, i, new_mem_index;
-
+  guint num_mems, offset, new_mem_index;
   GstMemory *new_memory, *last_memory;
   gsize new_mem_size, last_mem_size;
-
   GstMapInfo new_memory_map, last_memory_map, incoming_memory_map;
   GstTensorExtraInfo *extra_info;
-  gboolean is_extra;
+  GstTensorMetaInfo meta;
+  gboolean is_extra, is_static;
 
   if (!GST_IS_BUFFER (buffer)) {
     nns_loge ("Failed to append memory, given buffer is invalid.");
@@ -1648,9 +1662,17 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
     return FALSE;
   }
 
-  if (!gst_tensor_info_validate (info)) {
-    nns_loge ("Failed to get tensor info (invalid input info).");
-    return FALSE;
+  if (gst_tensor_meta_info_parse_memory (&meta, memory)) {
+    is_static = (meta.format == _NNS_TENSOR_FORMAT_STATIC);
+  } else {
+    /* Suppose given memory is static tensor. */
+    is_static = TRUE;
+
+    /* Error case if given tensor-info is invalid. */
+    if (!gst_tensor_info_validate (info)) {
+      nns_loge ("Failed to get tensor info (invalid input info).");
+      return FALSE;
+    }
   }
 
   num_mems = gst_buffer_n_memory (buffer);
@@ -1676,7 +1698,7 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
   new_mem_size = last_mem_size = gst_memory_get_sizes (last_memory, NULL, NULL);
 
   /* if the memory does not have proper header, append it */
-  is_extra = gst_memory_is_extra_tensor (&last_memory_map);
+  is_extra = gst_memory_map_is_extra_tensor (&last_memory_map);
   if (!is_extra) {
     new_mem_size += sizeof (GstTensorExtraInfo);
   }
@@ -1723,10 +1745,11 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
   new_mem_index = extra_info->num_extra_tensors;
   extra_info->num_extra_tensors += 1;
 
-  /* append tensor info (except the tensor name) */
-  extra_info->infos[new_mem_index].type = info->type;
-  for (i = 0; i < NNS_TENSOR_RANK_LIMIT; ++i) {
-    extra_info->infos[new_mem_index].dimension[i] = info->dimension[i];
+  /* Copy tensor info into extra. */
+  if (is_static) {
+    gst_tensor_info_copy (&extra_info->infos[new_mem_index], info);
+  } else {
+    gst_tensor_meta_info_convert (&meta, &extra_info->infos[new_mem_index]);
   }
 
   memcpy (new_memory_map.data + offset + last_memory_map.size,
@@ -1746,7 +1769,7 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
  * @brief Get the number of tensors in the buffer.
  */
 guint
-gst_buffer_n_tensor (GstBuffer * buffer)
+gst_tensor_buffer_get_count (GstBuffer * buffer)
 {
   guint num_mems;
   GstMemory *mem;
@@ -1772,7 +1795,7 @@ gst_buffer_n_tensor (GstBuffer * buffer)
     return 0;
   }
 
-  if (gst_memory_is_extra_tensor (&map)) {
+  if (gst_memory_map_is_extra_tensor (&map)) {
     extra_info = (GstTensorExtraInfo *) map.data;
     num_mems = extra_info->num_extra_tensors + NNS_TENSOR_SIZE_LIMIT;
   } else {
@@ -1783,4 +1806,99 @@ gst_buffer_n_tensor (GstBuffer * buffer)
   gst_memory_unmap (mem, &map);
 
   return num_mems;
+}
+
+/**
+ * @brief Sets the value of a property based on the specified property value and GParamSpec.
+ *
+ * @param prop_value A pointer to the GValue where the property value will be set.
+ * @param param_spec A pointer to the GParamSpec that describes the property.
+ * @param property_value A string representing the value to be set for the property.
+ *
+ * @note This API is intended to be used by gst_tensor_parse_config_file ()
+ */
+
+static void
+set_property_value (GValue * prop_value, const GParamSpec * param_spec,
+    const gchar * property_value)
+{
+  GType value_type = G_PARAM_SPEC_VALUE_TYPE (param_spec);
+  g_value_init (prop_value, value_type);
+
+  if (value_type == G_TYPE_BOOLEAN) {
+    gboolean value = g_ascii_strcasecmp (property_value, "true") == 0;
+    g_value_set_boolean (prop_value, value);
+  } else if (value_type == G_TYPE_INT) {
+    gint value = atoi (property_value);
+    g_value_set_int (prop_value, value);
+  } else if (value_type == G_TYPE_UINT) {
+    guint value = atoi (property_value);
+    g_value_set_uint (prop_value, value);
+  } else if (value_type == G_TYPE_FLOAT) {
+    gfloat value = atof (property_value);
+    g_value_set_float (prop_value, value);
+  } else if (value_type == G_TYPE_DOUBLE) {
+    gdouble value = atof (property_value);
+    g_value_set_double (prop_value, value);
+  } else {
+    g_value_set_string (prop_value, property_value); /** default is string */
+  }
+}
+
+/**
+ * @brief Parses a configuration file and sets the corresponding properties on a GObject.
+ *
+ * This function reads the contents of the configuration file located at the given path
+ * and sets the properties of the specified GObject based on the configuration data.
+ *
+ * @param config_path The path to the configuration file.
+ * @param object      The GObject on which to set the properties.
+ *
+ * @note The responsibility of managing the memory of the GObject passed as a parameter
+ *       lies outside this function.
+ */
+
+void
+gst_tensor_parse_config_file (const gchar * config_path, const GObject * object)
+{
+  GError *error = NULL;
+  gchar *config_data = NULL;
+  gchar **lines = NULL;
+  gchar **line = NULL;
+  GObjectClass *g_object_class = G_OBJECT_GET_CLASS (object);
+
+  if (!g_file_get_contents (config_path, &config_data, NULL, &error)) {
+    GST_DEBUG ("Failed to read config file: %s\n", error->message);
+    g_error_free (error);
+    return;
+  }
+
+  lines = g_strsplit (config_data, "\n", -1);
+  g_free (config_data);
+
+  /** Iterate over each line */
+  for (line = lines; *line; ++line) {
+    gchar **parts = g_strsplit (*line, "=", 2);
+    if (g_strv_length (parts) == 2) {
+      gchar *property_name = g_strstrip (g_strdup (parts[0]));
+      gchar *property_value = g_strstrip (g_strdup (parts[1]));
+
+      GParamSpec *pdata =
+          g_object_class_find_property (g_object_class, property_name);
+
+      if (pdata != NULL) {
+        GValue prop_value = G_VALUE_INIT;
+        set_property_value (&prop_value, pdata, property_value);
+        g_object_set_property (G_OBJECT (object), pdata->name, &prop_value);
+        g_value_unset (&prop_value);
+      }
+
+      g_free (property_name);
+      g_free (property_value);
+    }
+
+    g_strfreev (parts);
+  }
+
+  g_strfreev (lines);
 }
